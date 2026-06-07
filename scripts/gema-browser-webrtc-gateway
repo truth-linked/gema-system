@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+import json
+import os
+import signal
+import sys
+import threading
+
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstSdp", "1.0")
+gi.require_version("GstWebRTC", "1.0")
+from gi.repository import GLib, Gst, GstSdp, GstWebRTC
+
+
+Gst.init(None)
+
+
+class Gateway:
+    def __init__(self):
+        self.loop = GLib.MainLoop()
+        self.webrtc = None
+        self.pipeline = None
+        self.ready = threading.Event()
+
+    def emit(self, payload):
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+    def build(self):
+        stun = os.environ.get("GEMA_WEBRTC_STUN_SERVER", "stun://stun.l.google.com:19302")
+        turn = os.environ.get("GEMA_WEBRTC_TURN_SERVER", "")
+        bitrate = int(os.environ.get("GEMA_WEBRTC_VP8_BITRATE_KBPS", "1800"))
+        fps = int(os.environ.get("GEMA_WEBRTC_FPS", "24"))
+        pipeline = (
+            "ximagesrc use-damage=0 show-pointer=true ! "
+            f"video/x-raw,framerate={fps}/1 ! queue max-size-buffers=2 leaky=downstream ! "
+            "videoconvert ! vp8enc deadline=1 cpu-used=8 keyframe-max-dist=30 "
+            f"target-bitrate={bitrate * 1000} ! rtpvp8pay name=pay pt=96"
+        )
+        self.pipeline = Gst.parse_launch(pipeline)
+        self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
+        if self.webrtc is None:
+            raise RuntimeError("GStreamer webrtcbin element is not installed")
+        self.webrtc.set_property("bundle-policy", "max-bundle")
+        self.webrtc.set_property("stun-server", stun)
+        if turn:
+            self.webrtc.set_property("turn-server", turn)
+        self.pipeline.add(self.webrtc)
+        pay = self.pipeline.get_by_name("pay")
+        pay_src = pay.get_static_pad("src") if pay else None
+        webrtc_sink = self.webrtc.request_pad_simple("sink_%u")
+        if pay_src is None or webrtc_sink is None or pay_src.link(webrtc_sink) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("failed to connect VP8 RTP stream to webrtcbin")
+        self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
+        self.webrtc.connect("pad-added", self.on_pad_added)
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.on_bus_message)
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self.ready.set()
+
+    def on_pad_added(self, _element, _pad):
+        return
+
+    def on_bus_message(self, _bus, message):
+        if message.type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            self.emit({"type": "webrtc_error", "message": str(err), "debug": debug or ""})
+        elif message.type == Gst.MessageType.WARNING:
+            err, debug = message.parse_warning()
+            self.emit({"type": "webrtc_warning", "message": str(err), "debug": debug or ""})
+
+    def on_ice_candidate(self, _element, mlineindex, candidate):
+        self.emit({"type": "candidate", "candidate": {"candidate": candidate, "sdpMLineIndex": mlineindex}})
+
+    def handle_offer(self, sdp):
+        res, sdpmsg = GstSdp.SDPMessage.new()
+        if res != GstSdp.SDPResult.OK:
+            raise RuntimeError("failed to allocate SDP message")
+        ret = GstSdp.sdp_message_parse_buffer(bytes(sdp, "utf-8"), sdpmsg)
+        if ret != GstSdp.SDPResult.OK:
+            raise RuntimeError(f"failed to parse offer SDP: {ret}")
+        offer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.OFFER, sdpmsg)
+        promise = Gst.Promise.new_with_change_func(self.on_remote_description_set, None)
+        self.webrtc.emit("set-remote-description", offer, promise)
+
+    def on_remote_description_set(self, promise, _):
+        promise.interrupt()
+        answer_promise = Gst.Promise.new_with_change_func(self.on_answer_created, None)
+        self.webrtc.emit("create-answer", None, answer_promise)
+
+    def on_answer_created(self, promise, _):
+        reply = promise.get_reply()
+        answer = reply.get_value("answer")
+        promise.interrupt()
+        local_promise = Gst.Promise.new()
+        self.webrtc.emit("set-local-description", answer, local_promise)
+        local_promise.interrupt()
+        self.emit({"type": "answer", "sdp_type": "answer", "sdp": answer.sdp.as_text()})
+
+    def handle_candidate(self, candidate):
+        text = candidate.get("candidate")
+        if not text:
+            return
+        mline = int(candidate.get("sdpMLineIndex", candidate.get("sdp_mline_index", 0)) or 0)
+        self.webrtc.emit("add-ice-candidate", mline, text)
+
+    def handle(self, payload):
+        kind = payload.get("type")
+        if kind == "offer":
+            self.handle_offer(payload.get("sdp") or "")
+        elif kind == "candidate":
+            self.handle_candidate(payload.get("candidate") or {})
+        elif kind == "ping":
+            self.emit({"type": "pong"})
+        elif kind == "close":
+            self.stop()
+        else:
+            self.emit({"type": "error", "code": "unsupported_gateway_message", "message": kind or "unknown"})
+
+    def stop(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+        self.loop.quit()
+
+
+gateway = Gateway()
+
+
+def reader():
+    gateway.ready.wait(10)
+    for line in sys.stdin:
+        try:
+            payload = json.loads(line)
+            GLib.idle_add(lambda p=payload: (gateway.handle(p), False)[1])
+        except Exception as exc:
+            gateway.emit({"type": "webrtc_error", "message": str(exc)})
+
+
+def stop(_signum, _frame):
+    gateway.stop()
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+gateway.build()
+threading.Thread(target=reader, daemon=True).start()
+gateway.emit({"type": "ready", "transport": "browser-webrtc"})
+gateway.loop.run()

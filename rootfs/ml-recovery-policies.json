@@ -1,0 +1,76 @@
+{
+  "schema": "gema.ml_framework_recovery_policies.v1",
+  "frameworks": {
+    "torch": {
+      "checkpoint": ".gema/checkpoints/torch/latest.pt",
+      "resume_hint": "load torch state_dict plus optimizer, scheduler, epoch, and rng state"
+    },
+    "transformers": {
+      "checkpoint_dir": ".gema/checkpoints/transformers",
+      "resume_args": ["--resume_from_checkpoint", ".gema/checkpoints/transformers"]
+    },
+    "accelerate": {
+      "project_dir": ".gema/checkpoints/accelerate",
+      "resume_hint": "accelerator.load_state(checkpoint_dir)"
+    },
+    "deepspeed": {
+      "checkpoint_dir": ".gema/checkpoints/deepspeed",
+      "resume_hint": "engine.load_checkpoint(checkpoint_dir)"
+    },
+    "lightning": {
+      "checkpoint_dir": ".gema/checkpoints/lightning",
+      "resume_args": ["ckpt_path", "last"]
+    },
+    "ray": {
+      "storage_path": ".gema/checkpoints/ray",
+      "resume_hint": "restore Ray Train/Tune run from storage_path"
+    },
+    "stable_baselines3": {
+      "checkpoint_dir": ".gema/checkpoints/rl/stable-baselines3",
+      "resume_hint": "model = Algo.load(path, env=env)"
+    },
+    "rllib": {
+      "checkpoint_dir": ".gema/checkpoints/rl/rllib",
+      "resume_hint": "Algorithm.from_checkpoint(checkpoint_dir)"
+    },
+    "vllm": {
+      "state": "stateless_serving",
+      "resume_hint": "restart server with original model, tensor parallelism, cache, and port contract"
+    },
+    "mlflow": {
+      "tracking_dir": ".gema/checkpoints/mlflow",
+      "resume_hint": "preserve tracking URI and run id"
+    },
+    "dvc": {
+      "workspace": ".",
+      "resume_hint": "dvc status, dvc pull, dvc repro"
+    },
+    "lakefs": {
+      "workspace": ".",
+      "resume_hint": "preserve lakeFS repo, branch, commit, and object prefix"
+    }
+  },
+  "validation": {
+    "gpu_required": [
+      "torch.cuda.is_available",
+      "bitsandbytes CUDA load",
+      "xformers CUDA path",
+      "vllm serve",
+      "deepspeed smoke",
+      "nccl distributed smoke",
+      "tensorrt import",
+      "flash attention import when installed"
+    ],
+    "cpu_validated": [
+      "imports",
+      "pip check",
+      "checkpoint contract generation",
+      "recovery policy presence"
+    ]
+  },
+  "unsupported_by_default": {
+    "tensorrt_full_libs": "Compatible wheels exist, but full TensorRT libraries are multi-GB per CUDA lane. Install only in an explicit TensorRT image/profile or GPU-worker build, not the default wheel-only ML lanes.",
+    "flash_attn": "Requires GPU-worker/toolchain validation. Do not build from source inside wheel-only CPU image refresh.",
+    "pyannote.audio_latest": "Latest releases may pull Torch/Numpy versions outside the pinned CUDA lane contract. Use speechbrain/silero-vad by default or validate pyannote on a GPU worker."
+  }
+}

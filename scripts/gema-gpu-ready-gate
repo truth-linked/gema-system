@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+if [ "${GEMA_CUDA_PROXY_READY:-0}" = "1" ]; then
+  exit 0
+fi
+workspace="${GEMA_PROJECT_DIR:-${GEMA_WORKSPACE:-$PWD}}"
+python="${PYTHON:-/usr/bin/python3}"
+"$python" - "$workspace" <<'PY'
+import json
+import pathlib
+import sys
+workspace = pathlib.Path(sys.argv[1])
+for rel in (".gema/fabric/cuda_proxy_state.json", ".gema/agent/fabric/cuda_proxy_state.json"):
+    path = workspace / rel
+    try:
+        state = json.loads(path.read_text())
+    except Exception:
+        continue
+    if state.get("ready") is True and state.get("status") == "validated":
+        raise SystemExit(0)
+raise SystemExit(79)
+PY

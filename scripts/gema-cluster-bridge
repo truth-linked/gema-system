@@ -1,0 +1,829 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import hashlib
+import json
+import os
+import selectors
+import signal
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+
+SCHEMA = "gema.fabric_bridge.v1"
+MAX_BLOB = 32 * 1024 * 1024
+PROCS = {}
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def write_frame(stream, payload):
+    stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    stream.flush()
+
+
+def read_frame(stream):
+    line = stream.readline()
+    if not line:
+        raise EOFError("bridge agent closed")
+    return json.loads(line)
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def append_jsonl(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, sort_keys=True) + "\n")
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def safe_path(root, value):
+    root = Path(root).resolve()
+    target = (root / value.lstrip("/")).resolve()
+    if root != target and root not in target.parents:
+        raise ValueError("path escapes bridge root")
+    return target
+
+
+def local_info():
+    def run(cmd):
+        try:
+            return subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=8).stdout.strip()
+        except Exception as exc:
+            return f"error: {exc}"
+
+    return {
+        "schema": SCHEMA,
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "hostname_i": run("hostname -I || true"),
+        "routes": run("ip route || true"),
+        "public_ip": run("curl -fsS --max-time 5 https://api.ipify.org || true"),
+        "gpu": run("nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader || true"),
+        "time": now(),
+    }
+
+
+def handle_agent_request(root, req):
+    method = req.get("method")
+    params = req.get("params") or {}
+    if method == "ping":
+        return {"ok": True, "result": {"pong": True, "agent": local_info()}}
+    if method == "info":
+        return {"ok": True, "result": local_info()}
+    if method == "write_file":
+        path = safe_path(root, str(params.get("path") or ""))
+        raw = base64.b64decode(params.get("data_b64") or "", validate=True)
+        if len(raw) > MAX_BLOB:
+            return {"ok": False, "error": "blob too large"}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        return {"ok": True, "result": {"path": str(path), "bytes": len(raw), "sha256": sha256_bytes(raw)}}
+    if method == "read_file":
+        path = safe_path(root, str(params.get("path") or ""))
+        raw = path.read_bytes()
+        if len(raw) > MAX_BLOB:
+            return {"ok": False, "error": "blob too large"}
+        return {
+            "ok": True,
+            "result": {
+                "path": str(path),
+                "bytes": len(raw),
+                "sha256": sha256_bytes(raw),
+                "data_b64": base64.b64encode(raw).decode(),
+            },
+        }
+    if method == "exists":
+        path = safe_path(root, str(params.get("path") or ""))
+        return {"ok": True, "result": {"path": str(path), "exists": path.exists()}}
+    if method == "exec":
+        argv = params.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+            return {"ok": False, "error": "argv required"}
+        timeout = min(max(int(params.get("timeout", 60)), 1), 3600)
+        cwd = safe_path(root, str(params.get("cwd") or "."))
+        env = os.environ.copy()
+        for key, value in (params.get("env") or {}).items():
+            if isinstance(key, str) and isinstance(value, str):
+                env[key] = value
+        started = time.monotonic()
+        proc = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout)
+        return {
+            "ok": proc.returncode == 0,
+            "result": {
+                "returncode": proc.returncode,
+                "stdout": proc.stdout[-20000:],
+                "stderr": proc.stderr[-20000:],
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "argv": argv,
+            },
+        }
+    if method == "start_exec":
+        argv = params.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+            return {"ok": False, "error": "argv required"}
+        cwd = safe_path(root, str(params.get("cwd") or "."))
+        env = os.environ.copy()
+        for key, value in (params.get("env") or {}).items():
+            if isinstance(key, str) and isinstance(value, str):
+                env[key] = value
+        proc_id = str(params.get("proc_id") or f"proc-{int(time.time() * 1000)}-{len(PROCS)}")
+        log_dir = safe_path(root, ".gema/fabric/procs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = log_dir / f"{proc_id}.stdout"
+        stderr_path = log_dir / f"{proc_id}.stderr"
+        stdout = stdout_path.open("ab")
+        stderr = stderr_path.open("ab")
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
+        PROCS[proc_id] = {
+            "proc": proc,
+            "argv": argv,
+            "started_at": now(),
+            "stdout": stdout_path,
+            "stderr": stderr_path,
+            "stdout_handle": stdout,
+            "stderr_handle": stderr,
+        }
+        return {"ok": True, "result": {"proc_id": proc_id, "pid": proc.pid, "argv": argv, "stdout": str(stdout_path), "stderr": str(stderr_path)}}
+    if method == "proc_status":
+        proc_id = str(params.get("proc_id") or "")
+        record = PROCS.get(proc_id)
+        if not record:
+            return {"ok": False, "error": "unknown proc_id"}
+        proc = record["proc"]
+        code = proc.poll()
+        return {
+            "ok": True,
+            "result": {
+                "proc_id": proc_id,
+                "pid": proc.pid,
+                "running": code is None,
+                "returncode": code,
+                "started_at": record["started_at"],
+                "stdout": str(record["stdout"]),
+                "stderr": str(record["stderr"]),
+            },
+        }
+    if method == "signal_proc":
+        proc_id = str(params.get("proc_id") or "")
+        sig = int(params.get("signal", signal.SIGTERM))
+        record = PROCS.get(proc_id)
+        if not record:
+            return {"ok": False, "error": "unknown proc_id"}
+        proc = record["proc"]
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                pass
+        return {"ok": True, "result": {"proc_id": proc_id, "pid": proc.pid, "signal": sig, "returncode": proc.poll()}}
+    return {"ok": False, "error": f"unsupported method: {method}"}
+
+
+def agent(args):
+    root = Path(args.root or os.environ.get("GEMA_BRIDGE_ROOT") or os.getcwd()).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    write_frame(sys.stdout, {"schema": SCHEMA, "type": "hello", "ok": True, "agent": local_info(), "root": str(root)})
+    while True:
+        try:
+            req = read_frame(sys.stdin)
+        except EOFError:
+            return 0
+        req_id = req.get("id")
+        try:
+            result = handle_agent_request(root, req)
+        except Exception as exc:
+            result = {"ok": False, "error": repr(exc)}
+        result.update({"schema": SCHEMA, "id": req_id, "type": "response"})
+        write_frame(sys.stdout, result)
+
+
+class AgentClient:
+    def __init__(self, proc, name):
+        self.proc = proc
+        self.name = name
+        self.next_id = 1
+        self.hello = read_frame(proc.stdout)
+
+    def call(self, method, params=None):
+        req_id = self.next_id
+        self.next_id += 1
+        write_frame(self.proc.stdin, {"schema": SCHEMA, "id": req_id, "method": method, "params": params or {}})
+        while True:
+            frame = read_frame(self.proc.stdout)
+            if frame.get("id") == req_id:
+                if not frame.get("ok"):
+                    raise RuntimeError(f"{self.name} {method} failed: {frame.get('error')} {frame.get('result')}")
+                return frame.get("result")
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+def start_local_agent(root, name):
+    proc = subprocess.Popen(
+        [sys.executable, __file__, "agent", "--root", str(root)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    return AgentClient(proc, name)
+
+
+def start_ssh_agent(host, port, remote_script, root, key=None, name=None):
+    cmd = ["ssh"]
+    if key:
+        cmd += ["-i", str(key)]
+    cmd += [
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
+        "-p",
+        str(port),
+        f"root@{host}",
+        f"python3 {shlex.quote(remote_script)} agent --root {shlex.quote(root)}",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    return AgentClient(proc, name or f"{host}:{port}")
+
+
+def bridge_collective(clients, step, losses):
+    if len(losses) != len(clients):
+        raise ValueError("loss count must match clients")
+    global_loss = sum(float(value) for value in losses) / len(losses)
+    payload = {
+        "schema": "gema.cluster_coupling.v1",
+        "step": int(step),
+        "world_size": len(clients),
+        "global_loss": global_loss,
+        "losses": {str(idx): float(value) for idx, value in enumerate(losses)},
+        "transport": "gema-ssh-stdio-bridge",
+        "updated_at": now(),
+    }
+    raw = json.dumps(payload, indent=2, sort_keys=True).encode()
+    encoded = base64.b64encode(raw).decode()
+    for client in clients:
+        client.call("write_file", {"path": ".gema/fabric/coupling.json", "data_b64": encoded})
+    return payload
+
+
+def fabric_event(workspace, event_type, details, severity="info"):
+    payload = {
+        "schema": "gema.fabric_event.v1",
+        "type": event_type,
+        "severity": severity,
+        "details": details,
+        "at": now(),
+    }
+    append_jsonl(Path(workspace) / ".gema" / "fabric" / "fabric.events.jsonl", payload)
+    if event_type.startswith("accelerator_"):
+        append_jsonl(Path(workspace) / ".gema" / "fabric" / "accelerator_worker.events.jsonl", payload)
+    return payload
+
+
+def read_execution_contract(workspace):
+    path = Path(workspace) / ".gema" / "fabric" / "execution_contract.json"
+    contract = load_json(path)
+    if not isinstance(contract, dict) or contract.get("schema") != "gema.execution_contract.v1":
+        raise SystemExit(f"missing or invalid execution contract: {path}")
+    return contract
+
+
+def command_from_contract(contract):
+    command = contract.get("command", {})
+    if isinstance(command, list):
+        argv = command
+    elif isinstance(command, dict):
+        argv = command.get("argv")
+    else:
+        argv = None
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+        raise SystemExit("execution contract has no runnable command argv")
+    return argv
+
+
+def recovery_ready(workspace, contract):
+    recovery = Path(workspace) / ".gema" / "recovery"
+    resume = load_json(recovery / "resume.json")
+    policy = load_json(recovery / "framework-checkpoint-policy.json")
+    checkpoint_policy = contract.get("checkpoint_policy", {})
+    return {
+        "resume_json": isinstance(resume, dict) and resume.get("schema") == "gema.ml_resume.v1",
+        "framework_checkpoint_policy": isinstance(policy, dict),
+        "contract_checkpoint_policy": isinstance(checkpoint_policy, dict),
+    }
+
+
+def selected_cuda_lane(contract):
+    return (
+        contract.get("image", {}).get("cuda_lane")
+        or contract.get("gpu_requirements", {}).get("cuda_lane")
+        or "auto"
+    )
+
+
+def cuda_exports(lane):
+    selector = shutil.which("gema-cuda-select") or "/opt/gema/bin/gema-cuda-select"
+    env = os.environ.copy()
+    env["GEMA_CUDA_LANE"] = str(lane or "auto")
+    if not Path(selector).exists() and not shutil.which(selector):
+        return env, {
+            "selector": selector,
+            "selector_present": False,
+            "exports_applied": False,
+            "lane": lane,
+            "status": "selector_missing",
+        }
+    out = subprocess.run([selector, "--exports"], check=False, text=True, capture_output=True, env=env)
+    selected = lane
+    if out.returncode != 0:
+        return env, {
+            "selector": selector,
+            "selector_present": True,
+            "exports_applied": False,
+            "ok": False,
+            "lane": lane,
+            "status": "selector_failed",
+            "stderr": out.stderr.strip(),
+        }
+    for line in out.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.replace("${LD_LIBRARY_PATH:-}", env.get("LD_LIBRARY_PATH", ""))
+        env[key] = value
+        if key == "GEMA_CUDA_LANE_SELECTED":
+            selected = value
+    return env, {
+        "selector": selector,
+        "selector_present": True,
+        "exports_applied": True,
+        "ok": True,
+        "lane": selected,
+        "status": "ready",
+    }
+
+
+def detect_frameworks(command):
+    joined = " ".join(command).lower()
+    frameworks = []
+    checks = {
+        "torch": ["torchrun", "pytorch", "torch."],
+        "transformers": ["transformers", "trainer", "huggingface"],
+        "accelerate": ["accelerate"],
+        "lightning": ["lightning", "trainer.fit"],
+        "deepspeed": ["deepspeed"],
+        "ray": ["ray train", "ray.train"],
+        "vllm": ["vllm"],
+    }
+    for name, needles in checks.items():
+        if any(needle in joined for needle in needles):
+            frameworks.append(name)
+    if not frameworks:
+        frameworks.append("generic-python" if any("python" in part for part in command) else "generic-process")
+    return frameworks
+
+
+def looks_like_training(command):
+    joined = " ".join(command).lower()
+    return any(token in joined for token in (
+        "train",
+        "trainer.fit",
+        "accelerate launch",
+        "torchrun",
+        "deepspeed",
+        "finetune",
+        "fine-tune",
+        "sft",
+        "pretrain",
+        "ray train",
+    ))
+
+
+def snapshot_checkpoint_files(workspace):
+    checkpoint_root = Path(workspace) / ".gema" / "checkpoints"
+    files = []
+    if checkpoint_root.exists():
+        for path in checkpoint_root.rglob("*"):
+            if path.is_file():
+                files.append({
+                    "path": path.relative_to(workspace).as_posix(),
+                    "bytes": path.stat().st_size,
+                    "sha256": file_sha256(path),
+                })
+    return files
+
+
+def run_ml(args):
+    workspace = Path(os.environ.get("GEMA_PROJECT_DIR", os.getcwd())).resolve()
+    agent_dir = Path(os.environ.get("GEMA_AGENT_DIR", str(workspace / ".gema" / "agent"))).resolve()
+    session_id = os.environ.get("SESSION_ID", os.environ.get("GEMA_SESSION_ID", "unknown"))
+    runtime_dir = workspace / ".gema" / "runtime"
+    recovery_dir = workspace / ".gema" / "recovery"
+    checkpoints_dir = workspace / ".gema" / "checkpoints"
+    mirror_dir = agent_dir / "ml-bridge"
+    for directory in (runtime_dir, recovery_dir, checkpoints_dir, workspace / ".gema" / "logs", mirror_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    command = args.command
+    if not command:
+        print("gema-fabric-bridge ml-run: command required after --", file=sys.stderr)
+        return 64
+
+    frameworks = detect_frameworks(command)
+    training_like = looks_like_training(command)
+    resume_contract = load_json(recovery_dir / "resume.json")
+    checkpoint_policy = load_json(recovery_dir / "framework-checkpoint-policy.json")
+    if not isinstance(resume_contract, dict) or resume_contract.get("schema") != "gema.ml_resume.v1":
+        print("gema-fabric-bridge: missing .gema/recovery/resume.json", file=sys.stderr)
+        return 78
+    if not isinstance(checkpoint_policy, dict):
+        print("gema-fabric-bridge: missing .gema/recovery/framework-checkpoint-policy.json", file=sys.stderr)
+        return 78
+    required = checkpoint_policy.get("framework_checkpoint", {}).get("required_before_expensive_training")
+    if training_like and required is not True:
+        print("gema-fabric-bridge: training-like command blocked without framework checkpoint policy", file=sys.stderr)
+        return 78
+
+    bridge_id = f"fabric-ml-{int(time.time())}-{os.getpid()}"
+    state_path = runtime_dir / "bridge-state.json"
+    heartbeat_path = runtime_dir / "bridge-heartbeat.json"
+    pause_request_path = runtime_dir / "pause-request.json"
+    checkpoint_manifest_path = checkpoints_dir / "manifest.json"
+
+    def mirror_write(name, value):
+        write_json(runtime_dir / name, value)
+        write_json(mirror_dir / name, value)
+
+    state = {
+        "schema": "gema.ml_bridge_state.v1",
+        "bridge_id": bridge_id,
+        "session_id": session_id,
+        "pid": os.getpid(),
+        "status": "starting",
+        "workspace": str(workspace),
+        "command": command,
+        "frameworks": frameworks,
+        "training_like": training_like,
+        "recovery_contract": str(recovery_dir / "resume.json"),
+        "checkpoint_policy": str(recovery_dir / "framework-checkpoint-policy.json"),
+        "updated_at": now(),
+    }
+    mirror_write("bridge-state.json", state)
+    child = subprocess.Popen(command)
+    state.update({"status": "running", "child_pid": child.pid, "updated_at": now()})
+    mirror_write("bridge-state.json", state)
+
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.is_set():
+            mirror_write("bridge-heartbeat.json", {
+                "schema": "gema.ml_bridge_heartbeat.v1",
+                "bridge_id": bridge_id,
+                "session_id": session_id,
+                "bridge_pid": os.getpid(),
+                "child_pid": child.pid,
+                "status": state.get("status", "running"),
+                "frameworks": frameworks,
+                "updated_at": now(),
+            })
+            time.sleep(2)
+
+    def request_pause(signum, _frame):
+        state.update({"status": "pause_requested", "last_signal": signum, "updated_at": now()})
+        mirror_write("bridge-state.json", state)
+        pause_request = {
+            "schema": "gema.fabric_pause_request.v1",
+            "bridge_id": bridge_id,
+            "session_id": session_id,
+            "signal": signum,
+            "requested_at": now(),
+            "checkpoint_dir": ".gema/checkpoints",
+        }
+        write_json(pause_request_path, pause_request)
+        write_json(mirror_dir / "pause-request.json", pause_request)
+        if child.poll() is None:
+            try:
+                child.send_signal(signal.SIGTERM if signum == signal.SIGTERM else signal.SIGUSR1)
+            except ProcessLookupError:
+                pass
+
+    signal.signal(signal.SIGUSR1, request_pause)
+    signal.signal(signal.SIGTERM, request_pause)
+    signal.signal(signal.SIGINT, request_pause)
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    exit_code = child.wait()
+    stop.set()
+    final_status = "paused" if pause_request_path.exists() else ("completed" if exit_code == 0 else "failed")
+    manifest = {
+        "schema": "gema.fabric_checkpoint_manifest.v1",
+        "bridge_id": bridge_id,
+        "session_id": session_id,
+        "status": final_status,
+        "exit_code": exit_code,
+        "frameworks": frameworks,
+        "checkpoint_files": snapshot_checkpoint_files(workspace),
+        "updated_at": now(),
+    }
+    write_json(checkpoint_manifest_path, manifest)
+    write_json(mirror_dir / "checkpoint-manifest.json", manifest)
+    state.update({"status": final_status, "exit_code": exit_code, "checkpoint_manifest": manifest, "updated_at": now()})
+    mirror_write("bridge-state.json", state)
+    return exit_code
+
+
+def run_accelerator(args):
+    workspace = Path(args.workspace or os.environ.get("GEMA_WORKSPACE") or os.getcwd()).resolve()
+    agent_dir = Path(args.agent_dir).resolve() if args.agent_dir else None
+    contract = read_execution_contract(workspace)
+    session_id = args.session_id or contract.get("session_id") or os.environ.get("GEMA_SESSION_ID", "unknown")
+    command = args.command if args.command else command_from_contract(contract)
+    lane = args.cuda_lane or selected_cuda_lane(contract)
+    checks = recovery_ready(workspace, contract)
+    strict = not args.allow_missing_recovery
+    if strict and not all(checks.values()):
+        state = {
+            "schema": "gema.accelerator_state.v1",
+            "session_id": session_id,
+            "status": "blocked_recovery_contract_missing",
+            "attached": False,
+            "strategy": "gema_fabric",
+            "contract_checksum": contract.get("checksum"),
+            "recovery_checks": checks,
+            "updated_at": now(),
+        }
+        write_fabric_state(workspace, agent_dir, state)
+        fabric_event(workspace, "accelerator_worker_blocked", {"reason": "recovery_contract_missing", "checks": checks}, "error")
+        return 78
+
+    env, lane_status = cuda_exports(lane)
+    env["GEMA_WORKSPACE"] = str(workspace)
+    env["GEMA_PROJECT_DIR"] = str(workspace)
+    env["GEMA_SESSION_ID"] = str(session_id)
+    env["SESSION_ID"] = str(session_id)
+    if agent_dir:
+        env["GEMA_AGENT_DIR"] = str(agent_dir)
+
+    runner = [sys.executable, __file__, "ml-run", "--", *command]
+    state = {
+        "schema": "gema.accelerator_state.v1",
+        "session_id": session_id,
+        "status": "running",
+        "attached": True,
+        "strategy": "gema_fabric",
+        "controller": "persistent_cpu_runtime",
+        "accelerator": "detachable_gpu_execution_twin",
+        "worker_pid": os.getpid(),
+        "contract_id": contract.get("id"),
+        "contract_checksum": contract.get("checksum"),
+        "image": contract.get("image", {}),
+        "cuda": lane_status,
+        "command": command,
+        "runner": runner,
+        "fabric_bridge": {"enabled": True, "schema": SCHEMA, "ml_enforced": True},
+        "recovery_checks": checks,
+        "started_at": now(),
+        "updated_at": now(),
+    }
+    write_fabric_state(workspace, agent_dir, state)
+    fabric_event(workspace, "accelerator_worker_started", {"session_id": session_id, "lane": lane_status, "fabric_bridge": True})
+
+    log_path = workspace / ".gema" / "logs" / "accelerator-worker.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as log:
+        log.write((f"{now()} exec {shlex.join(runner)}\n").encode())
+        child = subprocess.Popen(runner, cwd=workspace, env=env, stdout=log, stderr=log)
+
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.is_set():
+            heartbeat_state = dict(state)
+            heartbeat_state["status"] = "running" if child.poll() is None else state.get("status", "completed")
+            heartbeat_state["child_pid"] = child.pid
+            heartbeat_state["updated_at"] = now()
+            write_fabric_state(workspace, agent_dir, heartbeat_state)
+            time.sleep(args.heartbeat_interval)
+
+    def forward(signum, _frame):
+        fabric_event(workspace, "accelerator_worker_signal", {"signal": signum}, "warning")
+        if child.poll() is None:
+            child.send_signal(signum)
+
+    signal.signal(signal.SIGTERM, forward)
+    signal.signal(signal.SIGINT, forward)
+    signal.signal(signal.SIGUSR1, forward)
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    exit_code = child.wait()
+    stop.set()
+    final_status = "completed" if exit_code == 0 else "failed"
+    final_state = dict(state)
+    final_state.update({
+        "status": final_status,
+        "attached": False,
+        "child_pid": child.pid,
+        "exit_code": exit_code,
+        "checkpoint_manifest": load_json(workspace / ".gema" / "checkpoints" / "manifest.json", {}),
+        "completed_at": now(),
+        "updated_at": now(),
+    })
+    write_fabric_state(workspace, agent_dir, final_state)
+    fabric_event(workspace, "accelerator_worker_finished", {"status": final_status, "exit_code": exit_code}, "info" if exit_code == 0 else "error")
+    return exit_code
+
+
+def write_fabric_state(workspace, agent_dir, state):
+    fabric = Path(workspace) / ".gema" / "fabric"
+    write_json(fabric / "accelerator_state.json", state)
+    write_json(fabric / "fabric_state.json", {
+        "schema": "gema.fabric_state.v1",
+        "status": state.get("status"),
+        "session_id": state.get("session_id"),
+        "accelerator": state,
+        "updated_at": now(),
+    })
+    if agent_dir:
+        write_json(Path(agent_dir) / "fabric" / "accelerator_state.json", state)
+        write_json(Path(agent_dir) / "fabric" / "fabric_state.json", {
+            "schema": "gema.fabric_state.v1",
+            "status": state.get("status"),
+            "session_id": state.get("session_id"),
+            "accelerator": state,
+            "updated_at": now(),
+        })
+
+
+def self_test(args):
+    with tempfile.TemporaryDirectory() as tmp:
+        roots = [Path(tmp) / "node0", Path(tmp) / "node1"]
+        clients = [start_local_agent(roots[0], "node0"), start_local_agent(roots[1], "node1")]
+        try:
+            started = time.monotonic()
+            pings = [client.call("ping") for client in clients]
+            ping_ms = int((time.monotonic() - started) * 1000)
+            data = os.urandom(1024 * 1024)
+            encoded = base64.b64encode(data).decode()
+            writes = [client.call("write_file", {"path": "payload.bin", "data_b64": encoded}) for client in clients]
+            reads = [client.call("read_file", {"path": "payload.bin"}) for client in clients]
+            losses = [0.5, 0.25]
+            coupling = bridge_collective(clients, 4, losses)
+            proc = clients[0].call("start_exec", {"proc_id": "self-test", "argv": [sys.executable, "-c", "import pathlib, time; pathlib.Path('started.txt').write_text('ok'); time.sleep(30)"], "cwd": "."})
+            proc_running = clients[0].call("proc_status", {"proc_id": "self-test"})
+            proc_signal = clients[0].call("signal_proc", {"proc_id": "self-test", "signal": signal.SIGTERM})
+            time.sleep(0.5)
+            proc_stopped = clients[0].call("proc_status", {"proc_id": "self-test"})
+            coupling_reads = [json.loads(base64.b64decode(client.call("read_file", {"path": ".gema/fabric/coupling.json"})["data_b64"])) for client in clients]
+            ok = (
+                all(item.get("pong") for item in pings)
+                and all(item["sha256"] == sha256_bytes(data) for item in writes)
+                and all(item["sha256"] == sha256_bytes(data) for item in reads)
+                and all(item["global_loss"] == coupling["global_loss"] for item in coupling_reads)
+                and proc_running["running"] is True
+                and proc_stopped["running"] is False
+            )
+            report = {
+                "schema": "gema.fabric_bridge.selftest.v1",
+                "ok": ok,
+                "ping_ms": ping_ms,
+                "coupling": coupling,
+                "process_control": {"start": proc, "running": proc_running, "signal": proc_signal, "stopped": proc_stopped},
+                "writes": writes,
+                "reads": [{"bytes": item["bytes"], "sha256": item["sha256"]} for item in reads],
+            }
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0 if ok else 2
+        finally:
+            for client in clients:
+                client.close()
+
+
+def normalize_command(command):
+    if command and command[0] == "--":
+        return command[1:]
+    return command
+
+
+def parse_ml(argv, prog):
+    parser = argparse.ArgumentParser(prog=prog)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    run_parser = sub.add_parser("run")
+    run_parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    args.command = normalize_command(args.command)
+    return run_ml(args)
+
+
+def parse_accelerator(argv, prog):
+    parser = argparse.ArgumentParser(prog=prog)
+    parser.add_argument("--workspace")
+    parser.add_argument("--agent-dir")
+    parser.add_argument("--session-id")
+    parser.add_argument("--cuda-lane")
+    parser.add_argument("--allow-missing-recovery", action="store_true")
+    parser.add_argument("--heartbeat-interval", type=float, default=2.0)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    args.command = normalize_command(args.command)
+    return run_accelerator(args)
+
+
+def main():
+    argv0 = Path(sys.argv[0]).name
+    if len(sys.argv) > 1 and sys.argv[1] in {"agent", "self-test", "ml-run", "accelerator-worker"}:
+        argv0 = "gema-fabric-bridge"
+    else:
+        if argv0 == "gema-ml-bridge":
+            return parse_ml(sys.argv[1:], argv0)
+        if argv0 == "gema-accelerator-worker":
+            return parse_accelerator(sys.argv[1:], argv0)
+
+    parser = argparse.ArgumentParser(prog="gema-fabric-bridge")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_agent = sub.add_parser("agent")
+    p_agent.add_argument("--root")
+
+    p_self = sub.add_parser("self-test")
+    p_self.set_defaults(func=self_test)
+
+    p_ml = sub.add_parser("ml-run")
+    p_ml.add_argument("command", nargs=argparse.REMAINDER)
+
+    p_worker = sub.add_parser("accelerator-worker")
+    p_worker.add_argument("--workspace")
+    p_worker.add_argument("--agent-dir")
+    p_worker.add_argument("--session-id")
+    p_worker.add_argument("--cuda-lane")
+    p_worker.add_argument("--allow-missing-recovery", action="store_true")
+    p_worker.add_argument("--heartbeat-interval", type=float, default=2.0)
+    p_worker.add_argument("command", nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+    if args.cmd == "agent":
+        return agent(args)
+    if args.cmd == "ml-run":
+        args.command = normalize_command(args.command)
+        return run_ml(args)
+    if args.cmd == "accelerator-worker":
+        args.command = normalize_command(args.command)
+        return run_accelerator(args)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,53 @@
+# Gema ML expansion stack.
+# This file covers additional serious ML user workflows beyond the core
+# PyTorch/HF/serving stack in ml-requirements.txt.
+
+# Reinforcement learning.
+setuptools<81
+dm-tree
+gymnasium
+stable-baselines3
+shimmy
+pettingzoo
+supersuit
+ale-py
+
+# Audio, speech, diarization, ASR/TTS building blocks.
+# pyannote.audio is intentionally not installed here because current releases
+# can pull Torch/Numpy versions that destabilize the pinned CUDA wheel lanes.
+# Gema ships SpeechBrain, VAD, Whisper variants from the core stack, and
+# pyannote-compatible policy metadata for GPU-worker validation.
+speechbrain
+silero-vad
+piper-tts
+noisereduce
+pyloudnorm
+webrtcvad
+jiwer
+
+# Vision beyond OpenCV/Diffusers.
+scikit-image
+imagecodecs
+supervision
+mediapipe
+
+# Graph ML.
+networkx
+torch-geometric
+
+# Classical ML.
+xgboost-cpu==3.2.0
+lightgbm
+catboost
+statsmodels
+shap
+
+# Dataset/versioning and lakehouse workflows.
+dvc[s3]
+lakefs
+lakefs-spec
+deltalake
+
+# GPU/runtime optimization helpers that have portable wheels.
+onnxruntime-gpu
+onnx-graphsurgeon

@@ -1,0 +1,49 @@
+{
+  "version": "gema.cuda_lanes.v1",
+  "default_lane": "cu121",
+  "python_lanes": [
+    {
+      "id": "cpu",
+      "cuda": null,
+      "torch_index": "https://download.pytorch.org/whl/cpu",
+      "full_ml": false
+    },
+    {
+      "id": "cu118",
+      "cuda": "11.8",
+      "torch_index": "https://download.pytorch.org/whl/cu118",
+      "full_ml": true
+    },
+    {
+      "id": "cu121",
+      "cuda": "12.1",
+      "torch_index": "https://download.pytorch.org/whl/cu121",
+      "full_ml": true
+    },
+    {
+      "id": "cu124",
+      "cuda": "12.4",
+      "torch_index": "https://download.pytorch.org/whl/cu124",
+      "full_ml": true
+    }
+  ],
+  "toolkit_packages": [
+    "cuda-toolkit-12-1",
+    "cuda-toolkit-12-2",
+    "cuda-toolkit-12-3",
+    "cuda-toolkit-12-4",
+    "cuda-toolkit-12-5",
+    "cuda-toolkit-12-6",
+    "cuda-toolkit-12-8",
+    "cuda-toolkit-12-9",
+    "cuda-toolkit-13-0",
+    "cuda-toolkit-13-1",
+    "cuda-toolkit-13-2"
+  ],
+  "optional_cuda_packages": [
+    "libcudnn9-cuda-12",
+    "libcudnn9-dev-cuda-12",
+    "libnccl2",
+    "libnccl-dev"
+  ]
+}

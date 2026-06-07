@@ -1,0 +1,10 @@
+/target/
+**/__pycache__/
+*.py[cod]
+*.pyo
+server.pid
+*.log
+.gema/
+.agents/
+.codex/
+.DS_Store

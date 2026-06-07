@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+cmd="$(basename "$0")"
+if ! /opt/gema/bin/gema-gpu-ready-gate; then
+  echo "gema: GPU command '$cmd' is blocked until cuda_proxy.ready=true" >&2
+  exit 79
+fi
+env_dir="$(timeout 3 /opt/gema/bin/gema-cuda-select --env 2>/dev/null || true)"
+eval "$(timeout 3 /opt/gema/bin/gema-cuda-select --exports 2>/dev/null || true)"
+export GEMA_CUDA_LANE_SELECTED VIRTUAL_ENV PATH CUDA_HOME CUDA_PATH LD_LIBRARY_PATH
+for dir in "$env_dir/bin" /usr/local/bin /usr/bin /bin; do
+  target="$dir/$cmd"
+  if [ -x "$target" ] && [ "$target" != "$0" ]; then
+    exec "$target" "$@"
+  fi
+done
+echo "gema: GPU command '$cmd' is ready-gated but no backend executable was found" >&2
+exit 127

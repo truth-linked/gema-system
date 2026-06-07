@@ -1,0 +1,61 @@
+[Unit]
+Description=Gema native runtime host daemon
+Documentation=file:/root/gema-system/docs/HOSTD.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/gema-system
+Environment=GEMA_SYSTEM_SCRIPT_DIR=/root/gema-system/scripts
+Environment=GEMA_SYSTEM_ROOT=/var/lib/gema-system
+Environment=GEMA_HOSTD_RUN_DIR=/run/gema-system
+Environment=GEMA_HOSTD_LOG_DIR=/var/lib/gema-system/logs
+ExecStart=/root/gema-system/target/release/gema-runtime hostd serve
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=45s
+KillMode=mixed
+StateDirectory=gema-system
+RuntimeDirectory=gema-system
+LogsDirectory=gema-system
+UMask=0077
+
+# Hostd is intentionally privileged: it creates cgroups, cgroup-device eBPF
+# programs, mount-backed storage, overlay rootfs mounts, network namespaces,
+# veth links, port routers, FUSE mounts, and CRIU checkpoints. The hardening
+# below narrows the service without removing those required control surfaces.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_KILL CAP_MKNOD CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SETGID CAP_SETPCAP CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE CAP_SYS_RESOURCE CAP_BPF CAP_PERFMON CAP_CHECKPOINT_RESTORE
+AmbientCapabilities=
+SecureBits=keep-caps
+PrivateTmp=yes
+PrivateDevices=no
+PrivateMounts=no
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/gema-system /run/gema-system /run/netns /sys/fs/cgroup /sys/fs/bpf /tmp
+ReadOnlyPaths=/root/gema-system
+ProtectClock=yes
+ProtectHostname=no
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=no
+ProtectControlGroups=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+RestrictNamespaces=no
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictRealtime=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+KeyringMode=private
+ProcSubset=all
+ProtectProc=default
+DevicePolicy=auto
+
+[Install]
+WantedBy=multi-user.target
