@@ -14,28 +14,6 @@ lifecycle directly:
 - storage mounts
 - agent-visible runtime state
 
-The runtime starts with OCI compatibility through `runc`/`buildah`, then moves
-the Gema-specific pieces out of container entrypoint scripts and into a daemon
-that speaks Gema directly.
-
-## Current Host
-
-The current server has:
-
-- `runc`
-- `buildah`
-- `btrfs`
-
-Missing on this host:
-
-- NVIDIA driver/runtime tools
-- NVIDIA Container Toolkit
-- ROCm tools
-- `crun`
-- ZFS
-
-That is acceptable for control-plane development. GPU hosts must pass the host
-probe before running paid GPU workspaces.
 
 ## First Runtime Contract
 
